@@ -1,0 +1,16 @@
+build/
+*.o
+*.so
+*.a
+*.exe
+profiling_reports/
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+__pycache__/
+*.pyc
+.vscode/
+
+# Personal notes (not for public repo)
+KNOWLEDGE.md
+PROJECT_PLAN.md
