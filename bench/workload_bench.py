@@ -1,296 +1,284 @@
+"""Rollout-aware causal-attention benchmark.
+
+This harness intentionally separates measured latency from analytical cost models:
+  * padded and length-bucketed causal attention are timed with CUDA events;
+  * prefix sharing reports KV/projection savings, not fictitious attention savings.
+
+FlashAttention-2 is optional. Its fixed-length API is compared only on matching
+causal shapes; packed varlen attention is the next milestone (see target_design).
 """
-Phase 5.5: RL Rollout Inference Workload Benchmark
 
-Compare attention implementations across RL-representative workload patterns.
-Goal: Find which implementation works best under which conditions,
-      and explain WHY using profiling data.
-
-Implementations compared:
-  1. PyTorch SDPA (torch.nn.functional.scaled_dot_product_attention)
-  2. FlashAttention-2 (pip install flash-attn)
-
-Workload patterns:
-  1. Uniform: all sequences same length (baseline)
-  2. High-variance: RL rollout lengths vary wildly (512 to 8192)
-  3. Shared-prefix: all sequences share a long prefix (RL system prompt)
-
-Usage:
-  pip install torch flash-attn
-  python bench/workload_bench.py
-
-  With profiling:
-  nsys profile --trace=cuda python bench/workload_bench.py
-"""
+import argparse
+import json
+import math
+import platform
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from statistics import median
 
 import torch
 import torch.nn.functional as F
-import time
-import argparse
 
-# Try importing flash_attn
 try:
     from flash_attn import flash_attn_func
+
     HAS_FLASH_ATTN = True
 except ImportError:
+    flash_attn_func = None
     HAS_FLASH_ATTN = False
-    print("[WARNING] flash-attn not installed. Install with: pip install flash-attn")
-    print("         Only PyTorch SDPA will be benchmarked.\n")
 
 
-def benchmark_fn(fn, warmup=5, runs=20):
-    """Benchmark a function with CUDA event timing."""
-    # Warmup
+DEFAULT_ROLLOUT_LENGTHS = [512, 1024, 2048, 512, 4096, 1024, 2048, 8192]
+QUICK_ROLLOUT_LENGTHS = [128, 256, 512, 128, 512, 256, 384, 512]
+
+
+def percentile(values, q):
+    """Nearest-rank percentile for a non-empty sequence."""
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, math.ceil(len(ordered) * q) - 1))
+    return ordered[index]
+
+
+def benchmark_cuda(fn, warmup, runs):
+    """Return CUDA-event samples in milliseconds; synchronization is intentional."""
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
 
-    # Timed runs
     start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    start.record()
+    stop = torch.cuda.Event(enable_timing=True)
+    samples_ms = []
     for _ in range(runs):
+        start.record()
         fn()
-    end.record()
-    torch.cuda.synchronize()
+        stop.record()
+        stop.synchronize()
+        samples_ms.append(start.elapsed_time(stop))
 
-    avg_ms = start.elapsed_time(end) / runs
-    return avg_ms
-
-
-def run_sdpa(Q, K, V, is_causal=True):
-    """PyTorch's built-in scaled dot-product attention."""
-    return F.scaled_dot_product_attention(Q, K, V, is_causal=is_causal)
-
-
-def run_flash_attn(Q, K, V, causal=True):
-    """FlashAttention-2. Expects (batch, seq_len, num_heads, head_dim)."""
-    # flash_attn expects (B, S, H, D) not (B, H, S, D)
-    Q_t = Q.transpose(1, 2)
-    K_t = K.transpose(1, 2)
-    V_t = V.transpose(1, 2)
-    out = flash_attn_func(Q_t, K_t, V_t, causal=causal)
-    return out.transpose(1, 2)
+    return {
+        "samples_ms": samples_ms,
+        "median_ms": median(samples_ms),
+        "p95_ms": percentile(samples_ms, 0.95),
+        "min_ms": min(samples_ms),
+    }
 
 
-def workload_uniform(batch_size, seq_len, num_heads, head_dim, dtype):
-    """All sequences same length."""
-    Q = torch.randn(batch_size, num_heads, seq_len, head_dim, device='cuda', dtype=dtype)
-    K = torch.randn(batch_size, num_heads, seq_len, head_dim, device='cuda', dtype=dtype)
-    V = torch.randn(batch_size, num_heads, seq_len, head_dim, device='cuda', dtype=dtype)
-    return Q, K, V
+def make_qkv(batch, seq_len, num_heads, head_dim, dtype):
+    shape = (batch, num_heads, seq_len, head_dim)
+    return tuple(torch.randn(shape, device="cuda", dtype=dtype) for _ in range(3))
 
 
-def workload_high_variance(num_heads, head_dim, dtype):
-    """
-    RL rollout: batch of 8 sequences with wildly different lengths.
-    Simulates: some rollouts finish quickly, some go very long.
-
-    Since standard attention requires same seq_len in a batch,
-    we pad to max and note the waste.
-    """
-    # Realistic RL rollout lengths
-    seq_lens = [512, 1024, 2048, 512, 4096, 1024, 2048, 8192]
-    max_len = max(seq_lens)
-    batch_size = len(seq_lens)
-
-    # Create padded tensors
-    Q = torch.zeros(batch_size, num_heads, max_len, head_dim, device='cuda', dtype=dtype)
-    K = torch.zeros(batch_size, num_heads, max_len, head_dim, device='cuda', dtype=dtype)
-    V = torch.zeros(batch_size, num_heads, max_len, head_dim, device='cuda', dtype=dtype)
-
-    for i, sl in enumerate(seq_lens):
-        Q[i, :, :sl, :] = torch.randn(num_heads, sl, head_dim, device='cuda', dtype=dtype)
-        K[i, :, :sl, :] = torch.randn(num_heads, sl, head_dim, device='cuda', dtype=dtype)
-        V[i, :, :sl, :] = torch.randn(num_heads, sl, head_dim, device='cuda', dtype=dtype)
-
-    total_tokens = sum(seq_lens)
-    padded_tokens = batch_size * max_len
-    waste_pct = (1 - total_tokens / padded_tokens) * 100
-
-    return Q, K, V, seq_lens, waste_pct
+def sdpa(Q, K, V):
+    return F.scaled_dot_product_attention(Q, K, V, is_causal=True)
 
 
-def workload_shared_prefix(batch_size, prefix_len, unique_len, num_heads, head_dim, dtype):
-    """
-    All rollouts share the same system prompt (prefix),
-    but have different unique suffixes.
-
-    Without prefix caching: prefix KV is recomputed for each batch item.
-    This measures the "naive" cost.
-    """
-    total_len = prefix_len + unique_len
-
-    # Shared prefix (same for all batch items)
-    prefix_K = torch.randn(1, num_heads, prefix_len, head_dim, device='cuda', dtype=dtype)
-    prefix_V = torch.randn(1, num_heads, prefix_len, head_dim, device='cuda', dtype=dtype)
-
-    # Expand prefix to full batch (simulates recomputation)
-    K_prefix = prefix_K.expand(batch_size, -1, -1, -1)
-    V_prefix = prefix_V.expand(batch_size, -1, -1, -1)
-
-    # Unique suffixes
-    K_unique = torch.randn(batch_size, num_heads, unique_len, head_dim, device='cuda', dtype=dtype)
-    V_unique = torch.randn(batch_size, num_heads, unique_len, head_dim, device='cuda', dtype=dtype)
-
-    # Full K, V = [prefix | unique]
-    K_full = torch.cat([K_prefix, K_unique], dim=2)
-    V_full = torch.cat([V_prefix, V_unique], dim=2)
-
-    # Q attends to full sequence
-    Q = torch.randn(batch_size, num_heads, total_len, head_dim, device='cuda', dtype=dtype)
-
-    redundant_compute_pct = (prefix_len / total_len) * 100
-
-    return Q, K_full, V_full, redundant_compute_pct
+def flash_attention(Q, K, V):
+    """FA2 fixed-length API uses [batch, sequence, heads, dimension]."""
+    return flash_attn_func(
+        Q.transpose(1, 2), K.transpose(1, 2), V.transpose(1, 2), causal=True
+    ).transpose(1, 2)
 
 
-def print_header(title):
-    print(f"\n{'='*60}")
-    print(f"  {title}")
-    print(f"{'='*60}")
+def implementation_results(Q, K, V, warmup, runs):
+    """Time every available backend on exactly the same causal tensors."""
+    results = {"sdpa": benchmark_cuda(lambda: sdpa(Q, K, V), warmup, runs)}
+    if HAS_FLASH_ATTN:
+        try:
+            results["flash_attention_2"] = benchmark_cuda(
+                lambda: flash_attention(Q, K, V), warmup, runs
+            )
+        except (RuntimeError, NotImplementedError) as error:
+            results["flash_attention_2"] = {
+                "status": "unavailable_for_shape",
+                "error": str(error),
+            }
+    return results
 
 
-def print_result(name, ms, extra=""):
-    tflops_str = ""
-    print(f"  {name:<30} {ms:>8.3f} ms  {extra}")
+def uniform_experiment(args, dtype, seq_lens):
+    results = []
+    for seq_len in seq_lens:
+        Q, K, V = make_qkv(args.batch_size, seq_len, args.num_heads, args.head_dim, dtype)
+        backends = implementation_results(Q, K, V, args.warmup, args.runs)
+        results.append(
+            {
+                "shape": {
+                    "batch": args.batch_size,
+                    "seq_len": seq_len,
+                    "num_heads": args.num_heads,
+                    "head_dim": args.head_dim,
+                    "causal": True,
+                },
+                "backends": backends,
+            }
+        )
+        del Q, K, V
+    return results
+
+
+def variable_length_experiment(args, dtype, lengths):
+    """Compare one padded launch with a sequential schedule of exact-length groups."""
+    batch = len(lengths)
+    maximum = max(lengths)
+    groups = Counter(lengths)
+    useful_work = sum(length * length for length in lengths)
+    padded_work = batch * maximum * maximum
+
+    Q, K, V = make_qkv(batch, maximum, args.num_heads, args.head_dim, dtype)
+    padded = implementation_results(Q, K, V, args.warmup, args.runs)
+    del Q, K, V
+
+    bucket_tensors = {
+        length: make_qkv(count, length, args.num_heads, args.head_dim, dtype)
+        for length, count in sorted(groups.items())
+    }
+
+    def bucketed_sdpa():
+        for bucket_qkv in bucket_tensors.values():
+            sdpa(*bucket_qkv)
+
+    bucketed = {"sdpa": benchmark_cuda(bucketed_sdpa, args.warmup, args.runs)}
+    if HAS_FLASH_ATTN:
+        def bucketed_flash():
+            for bucket_qkv in bucket_tensors.values():
+                flash_attention(*bucket_qkv)
+
+        try:
+            bucketed["flash_attention_2"] = benchmark_cuda(
+                bucketed_flash, args.warmup, args.runs
+            )
+        except (RuntimeError, NotImplementedError) as error:
+            bucketed["flash_attention_2"] = {
+                "status": "unavailable_for_shape",
+                "error": str(error),
+            }
+
+    return {
+        "trace_lengths": lengths,
+        "length_buckets": [{"seq_len": length, "batch": count} for length, count in sorted(groups.items())],
+        "padded_shape": {"batch": batch, "seq_len": maximum},
+        "attention_work": {
+            "useful_relative_units": useful_work,
+            "padded_relative_units": padded_work,
+            "attention_work_efficiency": useful_work / padded_work,
+            "padding_work_fraction": 1 - useful_work / padded_work,
+            "note": "Relative causal-attention work derived from shape, not measured speedup.",
+        },
+        "padded": padded,
+        "length_bucketed_sequential": bucketed,
+        "methodology_note": "Bucketed timing includes all per-bucket launches; it is not a packed-varlen kernel.",
+    }
+
+
+def prefix_cache_model(batch, prefix_len, suffix_len, num_heads, head_dim, dtype):
+    """Account for what prefix KV reuse avoids, without claiming attention savings."""
+    bytes_per_element = torch.tensor([], dtype=dtype).element_size()
+    kv_elements_per_token = 2 * num_heads * head_dim
+    prefix_kv_elements = prefix_len * kv_elements_per_token
+    without_cache_elements = batch * prefix_kv_elements
+    with_cache_elements = prefix_kv_elements
+    avoided_elements = without_cache_elements - with_cache_elements
+    # K and V projections each multiply a hidden state by a head-sized output.
+    # This tracks only shared-prefix projection work; attention remains necessary.
+    projection_relative_flops_avoided = 2 * avoided_elements
+    return {
+        "batch": batch,
+        "prefix_len": prefix_len,
+        "suffix_len": suffix_len,
+        "dtype_bytes": bytes_per_element,
+        "prefix_kv_bytes_without_cache": without_cache_elements * bytes_per_element,
+        "prefix_kv_bytes_with_cache": with_cache_elements * bytes_per_element,
+        "prefix_kv_bytes_avoided": avoided_elements * bytes_per_element,
+        "prefix_kv_storage_reduction": avoided_elements / without_cache_elements,
+        "shared_prefix_kv_projection_relative_flops_avoided": projection_relative_flops_avoided,
+        "note": "This model excludes attention for suffix queries attending to the prefix. It is not an attention latency result.",
+    }
+
+
+def environment():
+    properties = torch.cuda.get_device_properties(0)
+    return {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "torch_cuda": torch.version.cuda,
+        "gpu": torch.cuda.get_device_name(0),
+        "gpu_compute_capability": f"{properties.major}.{properties.minor}",
+        "flash_attention_2_importable": HAS_FLASH_ATTN,
+    }
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Rollout-aware causal-attention benchmark")
+    parser.add_argument("--num-heads", type=int, default=32)
+    parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--dtype", choices=["fp16", "bf16"], default="fp16")
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--runs", type=int, default=30)
+    parser.add_argument("--quick", action="store_true", help="Use reduced shapes for a harness smoke test.")
+    parser.add_argument("--output", type=Path, help="Write the full JSON result to this path.")
+    return parser.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RL Workload Attention Benchmark")
-    parser.add_argument("--num-heads", type=int, default=32)
-    parser.add_argument("--head-dim", type=int, default=128)
-    parser.add_argument("--dtype", choices=["fp16", "bf16"], default="fp16")
-    args = parser.parse_args()
+    args = parse_args()
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA-enabled PyTorch is required: torch.cuda.is_available() is false.")
+    if args.warmup < 0 or args.runs < 1:
+        raise SystemExit("--warmup must be non-negative and --runs must be at least 1.")
 
-    num_heads = args.num_heads
-    head_dim = args.head_dim
     dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
+    uniform_lengths = [128, 512] if args.quick else [512, 2048, 4096, 8192]
+    rollout_lengths = QUICK_ROLLOUT_LENGTHS if args.quick else DEFAULT_ROLLOUT_LENGTHS
+    prefix_cases = [(args.batch_size, 512, 1536), (args.batch_size, 2048, 512)]
+    if args.quick:
+        prefix_cases = [(args.batch_size, 128, 384)]
 
-    print(f"GPU: {torch.cuda.get_device_name()}")
-    print(f"Config: num_heads={num_heads}, head_dim={head_dim}, dtype={args.dtype}")
-    print(f"FlashAttention available: {HAS_FLASH_ATTN}")
+    report = {
+        "environment": environment(),
+        "config": {
+            "num_heads": args.num_heads,
+            "head_dim": args.head_dim,
+            "dtype": args.dtype,
+            "warmup": args.warmup,
+            "runs": args.runs,
+            "quick": args.quick,
+            "causal": True,
+        },
+        "uniform_causal_attention": uniform_experiment(args, dtype, uniform_lengths),
+        "variable_length_rollout": variable_length_experiment(args, dtype, rollout_lengths),
+        "prefix_cache_cost_model": [
+            prefix_cache_model(batch, prefix, suffix, args.num_heads, args.head_dim, dtype)
+            for batch, prefix, suffix in prefix_cases
+        ],
+    }
 
-    # ============================================================
-    # Workload 1: Uniform (baseline)
-    # ============================================================
-    print_header("Workload 1: Uniform Seq Length (Baseline)")
+    variable = report["variable_length_rollout"]
+    work = variable["attention_work"]
+    print(f"GPU: {report['environment']['gpu']} | PyTorch CUDA: {report['environment']['torch_cuda']}")
+    print(f"FlashAttention-2 importable: {HAS_FLASH_ATTN}")
+    print("\nVariable-length rollout")
+    print(f"  trace lengths: {rollout_lengths}")
+    print(f"  shape-derived padding work: {work['padding_work_fraction']:.1%}")
+    for strategy in ("padded", "length_bucketed_sequential"):
+        print(f"  {strategy}:")
+        for backend, result in variable[strategy].items():
+            if "median_ms" in result:
+                print(f"    {backend}: median={result['median_ms']:.3f} ms, p95={result['p95_ms']:.3f} ms")
+            else:
+                print(f"    {backend}: {result['status']}")
 
-    for seq_len in [512, 2048, 4096, 8192]:
-        batch_size = 8
-        Q, K, V = workload_uniform(batch_size, seq_len, num_heads, head_dim, dtype)
-
-        print(f"\n  seq_len={seq_len}, batch={batch_size}")
-
-        ms = benchmark_fn(lambda: run_sdpa(Q, K, V))
-        print_result("PyTorch SDPA", ms)
-
-        if HAS_FLASH_ATTN:
-            ms = benchmark_fn(lambda: run_flash_attn(Q, K, V))
-            print_result("FlashAttention-2", ms)
-
-    # ============================================================
-    # Workload 2: High Variance (RL rollout pattern)
-    # ============================================================
-    print_header("Workload 2: High-Variance Seq Length (RL Rollout)")
-
-    Q, K, V, seq_lens, waste_pct = workload_high_variance(num_heads, head_dim, dtype)
-    print(f"\n  Seq lengths: {seq_lens}")
-    print(f"  Max (padded to): {max(seq_lens)}")
-    print(f"  Padding waste: {waste_pct:.1f}% of compute is on PAD tokens")
-    print(f"  (In production, ragged/varlen layout eliminates this waste)")
-
-    ms = benchmark_fn(lambda: run_sdpa(Q, K, V))
-    print_result("PyTorch SDPA (padded)", ms)
-
-    if HAS_FLASH_ATTN:
-        ms = benchmark_fn(lambda: run_flash_attn(Q, K, V))
-        print_result("FlashAttention-2 (padded)", ms)
-
-    # Compare: what if all sequences were just max_len? (uniform)
-    Q_u, K_u, V_u = workload_uniform(8, max(seq_lens), num_heads, head_dim, dtype)
-    ms_uniform = benchmark_fn(lambda: run_sdpa(Q_u, K_u, V_u))
-    print_result("PyTorch SDPA (uniform max)", ms_uniform, "(no variance, same total)")
-    print(f"\n  Insight: padded high-variance vs uniform max → similar time,")
-    print(f"  meaning {waste_pct:.0f}% of compute is wasted on padding.")
-
-    # ============================================================
-    # Workload 3: Shared Prefix (RL system prompt)
-    # ============================================================
-    print_header("Workload 3: Shared Prefix (RL System Prompt)")
-
-    batch_size = 8
-    for prefix_len, unique_len in [(512, 1536), (2048, 2048), (2048, 512)]:
-        Q, K, V, redundant_pct = workload_shared_prefix(
-            batch_size, prefix_len, unique_len, num_heads, head_dim, dtype
-        )
-        total_len = prefix_len + unique_len
-
-        print(f"\n  prefix={prefix_len}, unique={unique_len}, total={total_len}")
-        print(f"  Prefix compute redundancy: {redundant_pct:.0f}%")
-        print(f"  (With prefix caching, this {redundant_pct:.0f}% would be free)")
-
-        ms = benchmark_fn(lambda: run_sdpa(Q, K, V))
-        print_result("PyTorch SDPA", ms)
-
-        if HAS_FLASH_ATTN:
-            ms = benchmark_fn(lambda: run_flash_attn(Q, K, V))
-            print_result("FlashAttention-2", ms)
-
-    # ============================================================
-    # Workload 4: Scaling — how does latency grow with seq_len?
-    # ============================================================
-    print_header("Workload 4: Latency Scaling (seq_len growth during rollout)")
-    print("  Simulates context growing as Agent takes more steps")
-
-    batch_size = 1
-    results_sdpa = []
-    results_fa = []
-
-    for seq_len in [256, 512, 1024, 2048, 4096, 8192]:
-        Q, K, V = workload_uniform(batch_size, seq_len, num_heads, head_dim, dtype)
-
-        ms = benchmark_fn(lambda: run_sdpa(Q, K, V))
-        results_sdpa.append((seq_len, ms))
-
-        if HAS_FLASH_ATTN:
-            ms = benchmark_fn(lambda: run_flash_attn(Q, K, V))
-            results_fa.append((seq_len, ms))
-
-    print(f"\n  {'seq_len':<10} {'SDPA (ms)':<12} {'FA2 (ms)':<12} {'SDPA scaling':<14}")
-    base_sdpa = results_sdpa[0][1]
-    for i, (sl, ms) in enumerate(results_sdpa):
-        fa_ms = f"{results_fa[i][1]:.3f}" if results_fa else "N/A"
-        scaling = f"{ms/base_sdpa:.1f}x"
-        print(f"  {sl:<10} {ms:<12.3f} {fa_ms:<12} {scaling:<14}")
-
-    print(f"\n  Insight: O(N^2) attention → 2x seq_len ≈ 4x latency")
-    print(f"  Long RL trajectories hit this quadratic wall hard.")
-
-    # ============================================================
-    # Summary
-    # ============================================================
-    print_header("Summary & Profiling Next Steps")
-    print("""
-  What we measured:
-    1. Uniform baseline — establishes per-implementation speed
-    2. High-variance — quantifies padding waste in RL batches
-    3. Shared prefix — quantifies redundant KV compute without caching
-    4. Scaling curve — shows quadratic cost of growing context
-
-  Next: run with nsys/ncu to explain WHY:
-    nsys profile --trace=cuda python bench/workload_bench.py
-    → Look for: kernel launch gaps, idle time, memory transfer overhead
-
-    ncu --kernel-name regex:".*attention.*" python bench/workload_bench.py
-    → Look for: memory throughput, compute throughput, occupancy
-    → Compare numbers across workload patterns
-
-  Key questions to answer with profiling:
-    - Does padding waste show up as low compute throughput? (wasted FLOPS on zeros)
-    - Is there a seq_len threshold where FA2 starts beating SDPA?
-    - In shared-prefix workload, does L2 cache help at all? (same prefix data reaccessed)
-""")
+    encoded = json.dumps(report, indent=2)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(encoded + "\n", encoding="utf-8")
+        print(f"\nWrote report: {args.output}")
+    else:
+        print("\nNo --output provided; pass one to retain raw samples and environment metadata.")
 
 
 if __name__ == "__main__":

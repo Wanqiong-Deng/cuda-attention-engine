@@ -19,6 +19,9 @@ bool check_correctness(
     float mean_error = 0.0f;
     int worst_idx = 0;
 
+    // Cosine similarity
+    float dot = 0.0f, norm_gpu = 0.0f, norm_cpu = 0.0f;
+
     for (int i = 0; i < size; i++) {
         float err = fabsf(gpu_output[i] - cpu_output[i]);
         mean_error += err;
@@ -26,11 +29,16 @@ bool check_correctness(
             max_error = err;
             worst_idx = i;
         }
+        dot += gpu_output[i] * cpu_output[i];
+        norm_gpu += gpu_output[i] * gpu_output[i];
+        norm_cpu += cpu_output[i] * cpu_output[i];
     }
     mean_error /= size;
+    float cosine_sim = dot / (sqrtf(norm_gpu) * sqrtf(norm_cpu) + 1e-8f);
 
-    printf("  Max error:  %e (at index %d)\n", max_error, worst_idx);
-    printf("  Mean error: %e\n", mean_error);
+    printf("  Max abs error:    %e (at index %d)\n", max_error, worst_idx);
+    printf("  Mean abs error:   %e\n", mean_error);
+    printf("  Cosine similarity: %.8f\n", cosine_sim);
 
     if (max_error > tolerance) {
         printf("  FAILED: max error exceeds tolerance %e\n", tolerance);
